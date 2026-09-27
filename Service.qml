@@ -268,10 +268,14 @@ Item {
 
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applySearchOutput(text, "youtube")
+      onStreamFinished: if (root.searchProvider === "youtube") root.applySearchOutput(text, "youtube")
     }
 
+    // Switching provider mid-search kills this process, and its exit arrives
+    // after the other provider's search has started. Left unguarded it would
+    // stamp "Search failed" over that provider's results.
     onExited: function(exitCode) {
+      if (root.searchProvider !== "youtube") return
       root.searching = false
       if (exitCode !== 0 && root.searchResults.length === 0) root.searchError = "Search failed"
       else if (root.searchResults.length === 0) root.searchError = "No results"
@@ -340,10 +344,12 @@ Item {
 
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applySearchOutput(text, "spotify")
+      onStreamFinished: if (root.searchProvider === "spotify") root.applySearchOutput(text, "spotify")
     }
 
+    // Same guard as the YouTube search: ignore a run killed by a provider switch.
     onExited: function(exitCode) {
+      if (root.searchProvider !== "spotify") return
       root.searching = false
       if (exitCode === root.spotifyExitNotConnected) {
         root.spotifyConnected = false
