@@ -7,7 +7,9 @@ the token never enters the shell process and each step can be run by hand:
   spotify-helper login [CLIENT_ID]   one-time PKCE login in the browser
   spotify-helper status              "connected" or "disconnected"
   spotify-helper search QUERY [N]    tab-separated results, one per line
-  spotify-helper play URI            start URI on a Spotify Connect device
+  spotify-helper play URI [--related]
+                                     start URI on a Spotify Connect device,
+                                     optionally followed by more by its artist
   spotify-helper open [URI]          hand URI to the Spotify app (no API)
   spotify-helper logout              forget the stored token
 
@@ -20,6 +22,7 @@ import hashlib
 import http.server
 import json
 import os
+import random
 import re
 import secrets
 import socket
@@ -424,9 +427,50 @@ def spotifyd_device():
     return wait_for(find, 15)
 
 
-def start_playback(device, uri):
+def start_playback(device, uris):
     api("PUT", "/me/player/play?" + urllib.parse.urlencode({"device_id": device["id"]}),
-        body={"uris": [uri]})
+        body={"uris": uris})
+
+
+def related_uris(uri, limit=20, pages=3):
+    """More tracks by the picked track's artist, to play after it.
+
+    A track started on its own, with no album or playlist around it, just
+    stops when it ends: Spotify's own autoplay does not pick it up. And the
+    endpoints that would find genuinely similar music (recommendations,
+    related artists, artist top tracks) are closed to development-mode apps.
+    Search is not, so this is an artist mix rather than a radio.
+    """
+    track = api("GET", "/tracks/" + uri.rsplit(":", 1)[-1]) or {}
+    artists = track.get("artists") or []
+    if not artists:
+        return []
+    artist = artists[0].get("name", "").replace('"', "")
+    seen = {uri}
+    # Keyed on the title too, so the same song's remaster or live cut does not
+    # come straight back as "something else".
+    titles = {clean(track.get("name")).lower()}
+    out = []
+    # Search caps a page at 10 results, and popular songs fill a page with
+    # their own alternate versions, so look a few pages deep.
+    for offset in range(0, pages * 10, 10):
+        res = api("GET", "/search?" + urllib.parse.urlencode({
+            "q": 'artist:"%s"' % artist, "type": "track", "limit": 10, "offset": offset}))
+        for t in (res or {}).get("tracks", {}).get("items", []):
+            if not t or not t.get("uri") or t["uri"] in seen:
+                continue
+            if artist not in [a.get("name") for a in t.get("artists", [])]:
+                continue
+            title = clean(t.get("name")).lower()
+            if title in titles:
+                continue
+            seen.add(t["uri"])
+            titles.add(title)
+            out.append(t["uri"])
+    # Search order is roughly popularity, so the same few hits would lead
+    # every time; shuffle for something closer to a radio.
+    random.shuffle(out)
+    return out[:limit]
 
 
 def spotifyd_stream_open():
@@ -494,9 +538,18 @@ def cmd_play(args):
     uri = args[0]
 
     try:
+        # The pick always goes first, so audibly_playing can keep matching on
+        # it; a failed lookup just means no queue behind it.
+        uris = [uri]
+        if "--related" in args[1:]:
+            try:
+                uris += related_uris(uri)
+            except ApiError as e:
+                print("Related lookup failed: %s" % e, file=sys.stderr)
+
         headless = spotifyd_device()
         if headless:
-            start_playback(headless, uri)
+            start_playback(headless, uris)
             if audibly_playing(headless, uri):
                 mark_spotifyd(failed=False)
                 return 0
@@ -520,7 +573,7 @@ def cmd_play(args):
 
         if not device:
             return EXIT_NO_DEVICE
-        start_playback(device, uri)
+        start_playback(device, uris)
     except ApiError as e:
         if e.status == 403 and e.reason == "PREMIUM_REQUIRED":
             return EXIT_PREMIUM_REQUIRED

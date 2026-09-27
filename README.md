@@ -163,8 +163,13 @@ the helper starts the desktop app (`spotify-launcher` from `extra`) and waits
 for it to show up. Now-playing and the transport buttons come from the app's
 own MPRIS player, so they need no Spotify-specific handling.
 
-Autoplay related is YouTube-only. For Spotify, turn on the app's own
-**Autoplay** setting instead.
+**Autoplay related** works for Spotify too, but differently. A Spotify track
+started on its own just stops at the end, because Spotify's own autoplay does
+not pick it up. The endpoints that find similar music (recommendations,
+related artists, artist top tracks) are closed to development-mode apps. So
+with Autoplay related on, a Spotify pick starts with up to 20 more songs by
+the same artist queued behind it, in shuffled order: an artist mix rather than
+a radio. It applies to the next pick, not to what is already playing.
 
 ### Headless playback with spotifyd
 

@@ -607,15 +607,19 @@ BarWidget {
           onClicked: root.toggleRepeat()
         }
 
-        // Only applies to tracks this widget streamed via yt-dlp/mpv: on
-        // natural end, queues the next entry from YouTube's auto-generated
-        // radio playlist for that video.
+        // Applies to the next pick from the panel. YouTube: on natural end,
+        // mpv moves on to YouTube's auto-generated radio mix for that video.
+        // Spotify: more by the same artist is queued behind the pick, since
+        // the similar-music endpoints are closed to development-mode apps.
         Button {
           text: "Autoplay related"
           foreground: root.bar.foreground
           horizontalPadding: Style.spacing.controlPaddingX
           verticalPadding: Style.spacing.controlPaddingY
           selected: root.mediaService && root.mediaService.autoplayRelated
+          tooltipText: root.spotifyMode
+            ? "Next pick continues with more by the same artist"
+            : "When a track ends, play the next from YouTube's related mix"
           onClicked: if (root.mediaService) root.mediaService.toggleAutoplayRelated()
         }
       }

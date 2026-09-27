@@ -17,7 +17,8 @@ Item {
   // ---------------------------------------------------------- autoplay related
   // When on, a locally streamed track that finishes on its own (mpv reaches
   // EOF, not a manual stop/replace) queues the next entry from YouTube's
-  // auto-generated "radio" playlist for that video.
+  // auto-generated "radio" playlist for that video. A Spotify pick instead
+  // starts with more by the same artist queued behind it (see playSpotify).
   property bool autoplayRelated: false
   property string lastLocalVideoId: ""
   property var autoplayHistory: []
@@ -324,6 +325,7 @@ Item {
     } else {
       spotifyPlayProc.running = false
       spotifyPlayProc.uri = uri
+      spotifyPlayProc.related = autoplayRelated
       Qt.callLater(function() { spotifyPlayProc.running = true })
     }
     localPlaybackPending = { match: "spotify", attempts: 0 }
@@ -362,7 +364,11 @@ Item {
   Process {
     id: spotifyPlayProc
     property string uri: ""
-    command: [root.spotifyHelper, "play", uri]
+    // Autoplay for Spotify means queueing more by the same artist behind the
+    // pick up front: Spotify handles the transitions, so unlike the mpv path
+    // there is no end-of-track to watch for.
+    property bool related: false
+    command: related ? [root.spotifyHelper, "play", uri, "--related"] : [root.spotifyHelper, "play", uri]
 
     // Every failure still gets the track playing where it can: OpenUri on the
     // desktop app plays a track URI without the Web API, and without Premium.
