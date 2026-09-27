@@ -9,7 +9,7 @@ Because `mpv` registers on MPRIS, a track started from the panel flows back
 through this same service as an ordinary player. The now-playing readout and
 the transport buttons need no special casing for it.
 
-![The Media Search panel, showing YouTube results for a query](preview.png)
+![The Media Search panel, showing Spotify results for a query](preview.png)
 
 ## Features
 
