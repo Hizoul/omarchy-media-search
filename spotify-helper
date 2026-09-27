@@ -334,9 +334,9 @@ def wait_for(check, seconds):
     return check()
 
 
-def pick_device(devices, exclude=None):
+def pick_device(devices, exclude_name=None):
     usable = [d for d in devices
-              if d.get("id") and not d.get("is_restricted") and d.get("id") != exclude]
+              if d.get("id") and not d.get("is_restricted") and d.get("name") != exclude_name]
     for d in usable:
         if d.get("is_active"):
             return d
@@ -498,7 +498,10 @@ def cmd_play(args):
             mark_spotifyd(failed=True)
             print("spotifyd did not start playing; falling back to the app", file=sys.stderr)
 
-        exclude = headless["id"] if headless else None
+        # Past this point spotifyd has failed or is cooling down, but it can
+        # still be the active device, and pick_device prefers the active one.
+        # Leave it out by name so the fallback really reaches the app.
+        exclude = spotifyd_device_name()
         device = pick_device(api("GET", "/me/player/devices").get("devices", []), exclude)
 
         if not device and spotify_command():
