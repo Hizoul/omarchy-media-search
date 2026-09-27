@@ -51,6 +51,19 @@ BarWidget {
   readonly property var searchResults: mediaService ? mediaService.searchResults : []
   readonly property bool searching: mediaService ? mediaService.searching : false
   readonly property string searchError: mediaService ? mediaService.searchError : ""
+  readonly property string searchProvider: mediaService ? mediaService.searchProvider : "youtube"
+  readonly property bool spotifyMode: searchProvider === "spotify"
+  readonly property bool spotifyConnected: mediaService ? mediaService.spotifyConnected : false
+
+  // A login finished in the terminal lands while the panel is closed, so
+  // re-check on every open rather than only at startup.
+  onPopupOpenChanged: if (popupOpen && mediaService) mediaService.refreshSpotifyStatus()
+
+  function toggleProvider() {
+    if (!mediaService) return
+    selectedIndex = -1
+    mediaService.setSearchProvider(spotifyMode ? "youtube" : "spotify")
+  }
 
   // Overridable from this widget's entry in shell.json, so pointing the button
   // at a different service does not mean editing the plugin.
@@ -96,12 +109,12 @@ BarWidget {
 
   function activateCursor() {
     if (selectedIndex < 0 || selectedIndex >= searchResults.length) return
-    playResult(searchResults[selectedIndex].videoId)
+    playResult(searchResults[selectedIndex].id)
   }
 
-  function playResult(videoId) {
-    if (!mediaService || !videoId) return
-    mediaService.playResult(videoId)
+  function playResult(resultId) {
+    if (!mediaService || !resultId) return
+    mediaService.playResult(resultId)
     popupOpen = false
   }
 
@@ -263,13 +276,37 @@ BarWidget {
       spacing: Style.space(10)
 
       Row {
+        spacing: Style.space(6)
+
+        Button {
+          text: "YouTube"
+          foreground: root.bar.foreground
+          horizontalPadding: Style.spacing.controlPaddingX
+          verticalPadding: Style.spacing.controlPaddingY
+          selected: !root.spotifyMode
+          enabled: root.serviceAvailable
+          onClicked: if (root.spotifyMode) root.toggleProvider()
+        }
+
+        Button {
+          text: "Spotify"
+          foreground: root.bar.foreground
+          horizontalPadding: Style.spacing.controlPaddingX
+          verticalPadding: Style.spacing.controlPaddingY
+          selected: root.spotifyMode
+          enabled: root.serviceAvailable
+          onClicked: if (!root.spotifyMode) root.toggleProvider()
+        }
+      }
+
+      Row {
         width: parent.width
         spacing: Style.space(6)
 
         TextField {
           id: searchField
           width: parent.width - searchBtn.width - Style.space(6)
-          placeholderText: "Search music…"
+          placeholderText: root.spotifyMode ? "Search Spotify…" : "Search YouTube…"
           foreground: root.bar.foreground
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.body
@@ -281,6 +318,7 @@ BarWidget {
           // Down hands the keyboard to the result list; the field keeps Left
           // and Right for ordinary cursor movement within the query.
           Keys.onDownPressed: root.enterList()
+          Keys.onTabPressed: root.toggleProvider()
 
           // Layer-shell hands the surface focus on open, but Qt still needs an
           // item to hold active focus, so claim it once the panel maps.
@@ -311,6 +349,36 @@ BarWidget {
         wrapMode: Text.WordWrap
         elide: Text.ElideRight
         visible: text !== ""
+      }
+
+      // Without a login, Spotify still works: Enter opens the query in the
+      // Spotify app. Connecting adds results here and in-place playback.
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+        visible: root.serviceAvailable && root.spotifyMode && !root.spotifyConnected
+
+        Text {
+          width: parent.width - connectBtn.width - Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Not connected: searches open in the Spotify app."
+          color: Qt.darker(root.bar.foreground, 1.4)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        Button {
+          id: connectBtn
+          text: "Connect"
+          foreground: root.bar.foreground
+          horizontalPadding: Style.spacing.controlPaddingX
+          verticalPadding: Style.spacing.controlPaddingY
+          onClicked: {
+            root.mediaService.connectSpotify()
+            root.popupOpen = false
+          }
+        }
       }
 
       Column {
@@ -397,7 +465,7 @@ BarWidget {
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: root.playResult(resultRow.modelData.videoId)
+              onClicked: root.playResult(resultRow.modelData.id)
             }
           }
         }
@@ -554,12 +622,13 @@ BarWidget {
 
       Button {
         anchors.horizontalCenter: parent.horizontalCenter
-        text: "Open YouTube Music"
+        text: root.spotifyMode ? "Open Spotify" : "Open YouTube Music"
         foreground: root.bar.foreground
         horizontalPadding: Style.spacing.controlPaddingX
         verticalPadding: Style.spacing.controlPaddingY
         onClicked: {
-          if (root.bar) root.bar.run(root.launchCommand)
+          if (root.spotifyMode && root.mediaService) root.mediaService.openSpotify("")
+          else if (root.bar) root.bar.run(root.launchCommand)
           root.popupOpen = false
         }
       }

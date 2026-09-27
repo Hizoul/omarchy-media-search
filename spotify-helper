@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""Spotify side of Media Search.
+
+Everything that touches the Spotify Web API lives here rather than in QML, so
+the token never enters the shell process and each step can be run by hand:
+
+  spotify-helper login [CLIENT_ID]   one-time PKCE login in the browser
+  spotify-helper status              "connected" or "disconnected"
+  spotify-helper search QUERY [N]    tab-separated results, one per line
+  spotify-helper play URI            start URI on a Spotify Connect device
+  spotify-helper open [URI]          hand URI to the Spotify app (no API)
+  spotify-helper logout              forget the stored token
+
+Exit codes the service branches on: 2 not connected, 3 Premium required,
+4 no playback device. Anything else non-zero is a plain failure.
+"""
+
+import base64
+import hashlib
+import http.server
+import json
+import os
+import re
+import secrets
+import socket
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+EXIT_NOT_CONNECTED = 2
+EXIT_PREMIUM_REQUIRED = 3
+EXIT_NO_DEVICE = 4
+
+# Spotify only accepts an explicit loopback IP for plain-http redirect URIs;
+# "localhost" is rejected. This exact URI has to be added to the app's
+# Redirect URIs in the developer dashboard.
+PORT = int(os.environ.get("MEDIA_SEARCH_SPOTIFY_PORT", "8898"))
+REDIRECT_URI = "http://127.0.0.1:%d/callback" % PORT
+SCOPES = "user-read-playback-state user-modify-playback-state"
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "omarchy-media-search")
+STATE_FILE = os.path.join(STATE_DIR, "spotify.json")
+
+MPRIS_NAME = "org.mpris.MediaPlayer2.spotify"
+
+
+class NotConnected(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, status, reason):
+        super().__init__("%s %s" % (status, reason))
+        self.status = status
+        self.reason = reason
+
+
+# ------------------------------------------------------------------ state
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    # Created 0600 up front rather than chmod'd after, so the refresh token is
+    # never readable by anyone else, not even for a moment.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_FILE)
+
+
+# ------------------------------------------------------------------ http
+
+def request(method, url, token=None, form=None, body=None):
+    headers = {}
+    data = None
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    elif method in ("PUT", "POST"):
+        data = b""
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        reason = ""
+        try:
+            err = json.loads(e.read()).get("error")
+            if isinstance(err, dict):
+                reason = err.get("reason") or err.get("message", "")
+            else:
+                reason = str(err or "")
+        except (ValueError, AttributeError):
+            pass
+        raise ApiError(e.code, reason)
+
+
+def token_request(form):
+    return request("POST", "https://accounts.spotify.com/api/token", form=form)
+
+
+def access_token():
+    state = load_state()
+    if not state or not state.get("refresh_token"):
+        raise NotConnected()
+    if state.get("access_token") and state.get("expires_at", 0) > time.time() + 60:
+        return state["access_token"]
+    try:
+        tok = token_request({
+            "grant_type": "refresh_token",
+            "refresh_token": state["refresh_token"],
+            "client_id": state["client_id"],
+        })
+    except ApiError as e:
+        # A revoked grant, or an app whose owner's Premium lapsed, both come
+        # back as 400/401 here: the stored login is no longer any use.
+        if e.status in (400, 401):
+            raise NotConnected()
+        raise
+    state["access_token"] = tok["access_token"]
+    state["expires_at"] = time.time() + int(tok.get("expires_in", 3600))
+    # PKCE refresh tokens rotate: the old one stops working once a new one is
+    # issued, so it has to be written back.
+    if tok.get("refresh_token"):
+        state["refresh_token"] = tok["refresh_token"]
+    save_state(state)
+    return state["access_token"]
+
+
+def api(method, path, body=None):
+    return request(method, "https://api.spotify.com/v1" + path, token=access_token(), body=body)
+
+
+# ------------------------------------------------------------------ login
+
+def cmd_login(args):
+    client_id = args[0] if args else ""
+    if not client_id:
+        print("Create an app at https://developer.spotify.com/dashboard")
+        print("  Redirect URI:  " + REDIRECT_URI)
+        print("  API:           Web API")
+        print()
+        client_id = input("Client ID: ").strip()
+    if not client_id:
+        return 1
+
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    nonce = secrets.token_urlsafe(16)
+    auth_url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "scope": SCOPES,
+        "redirect_uri": REDIRECT_URI,
+        "code_challenge_method": "S256",
+        "code_challenge": challenge,
+        "state": nonce,
+    })
+
+    result = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = urllib.parse.urlparse(self.path)
+            if url.path != "/callback":
+                self.send_error(404)
+                return
+            q = urllib.parse.parse_qs(url.query)
+            if q.get("state", [""])[0] != nonce:
+                result["error"] = "state mismatch"
+            elif "error" in q:
+                result["error"] = q["error"][0]
+            else:
+                result["code"] = q.get("code", [""])[0]
+            ok = "code" in result
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(("Spotify connected. You can close this tab."
+                              if ok else "Login failed: " + result["error"]).encode())
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    server.timeout = 5
+    print("\nOpening the browser. If nothing opens, visit:\n" + auth_url + "\n")
+    subprocess.Popen(["xdg-open", auth_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Loop rather than serve one request: the browser may hit /favicon.ico
+    # before (or instead of) the callback.
+    deadline = time.time() + 300
+    while not result and time.time() < deadline:
+        server.handle_request()
+    server.server_close()
+    if not result:
+        result["error"] = "timed out waiting for the browser"
+
+    if "code" not in result:
+        print("Login failed: " + result["error"])
+        return 1
+
+    try:
+        tok = token_request({
+            "grant_type": "authorization_code",
+            "code": result["code"],
+            "redirect_uri": REDIRECT_URI,
+            "client_id": client_id,
+            "code_verifier": verifier,
+        })
+    except ApiError as e:
+        print("Token exchange failed: %s" % e)
+        return 1
+
+    save_state({
+        "client_id": client_id,
+        "refresh_token": tok["refresh_token"],
+        "access_token": tok["access_token"],
+        "expires_at": time.time() + int(tok.get("expires_in", 3600)),
+    })
+    print("Connected. Spotify results now show up in the Media Search panel.")
+    return 0
+
+
+def cmd_logout(args):
+    try:
+        os.remove(STATE_FILE)
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+def cmd_status(args):
+    try:
+        access_token()
+    except NotConnected:
+        print("disconnected")
+        return EXIT_NOT_CONNECTED
+    print("connected")
+    return 0
+
+
+# ------------------------------------------------------------------ search
+
+def clean(text):
+    # The output is tab/newline delimited, and track names can contain both.
+    return " ".join(str(text or "").split())
+
+
+def cmd_search(args):
+    if not args:
+        return 1
+    query = args[0]
+    # 10 is the Web API's cap since the February 2026 dev-mode changes.
+    limit = max(1, min(10, int(args[1]) if len(args) > 1 else 8))
+    res = api("GET", "/search?" + urllib.parse.urlencode({
+        "q": query, "type": "track", "limit": limit}))
+    for t in (res or {}).get("tracks", {}).get("items", []):
+        if not t or not t.get("uri"):
+            continue
+        artists = ", ".join(a.get("name", "") for a in t.get("artists", []))
+        print("\t".join([
+            t["uri"],
+            clean(t.get("name")),
+            clean(artists),
+            str(int(t.get("duration_ms", 0)) // 1000),
+        ]))
+    return 0
+
+
+# ------------------------------------------------------------------ play
+
+def spotify_running():
+    if not shutil.which("gdbus"):
+        return False
+    out = subprocess.run(
+        ["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+         "--object-path", "/org/freedesktop/DBus",
+         "--method", "org.freedesktop.DBus.NameHasOwner", MPRIS_NAME],
+        capture_output=True, text=True)
+    return "true" in out.stdout
+
+
+def spotify_command(uri=None):
+    """The desktop client's launch command, or None when it isn't installed.
+
+    Arch's spotify-launcher installs only `spotify-launcher`, which takes the
+    URI positionally; the client binary itself (AUR, Flatpak wrappers) is
+    `spotify` and wants --uri=.
+    """
+    if shutil.which("spotify"):
+        return ["spotify"] + (["--uri=" + uri] if uri else [])
+    if shutil.which("spotify-launcher"):
+        return ["spotify-launcher"] + ([uri] if uri else [])
+    return None
+
+
+def spotify_process_alive():
+    return subprocess.run(["pgrep", "-x", "spotify"],
+                          stdout=subprocess.DEVNULL).returncode == 0
+
+
+def launch_spotify(uri=None):
+    subprocess.Popen(spotify_command(uri), stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def wait_for(check, seconds):
+    for _ in range(seconds):
+        result = check()
+        if result:
+            return result
+        time.sleep(1)
+    return check()
+
+
+def pick_device(devices, exclude=None):
+    usable = [d for d in devices
+              if d.get("id") and not d.get("is_restricted") and d.get("id") != exclude]
+    for d in usable:
+        if d.get("is_active"):
+            return d
+    # Prefer this machine's desktop app over, say, a phone that happens to be
+    # signed in, when nothing is active yet.
+    for d in usable:
+        if d.get("type") == "Computer":
+            return d
+    return usable[0] if usable else None
+
+
+def spotifyd_device_name():
+    """The Connect name spotifyd registers under, or None without spotifyd."""
+    if not shutil.which("spotifyd"):
+        return None
+    conf = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                        "spotifyd", "spotifyd.conf")
+    try:
+        with open(conf) as f:
+            m = re.search(r'^\s*device_name\s*=\s*"([^"]*)"', f.read(), re.M)
+            if m and m.group(1):
+                return m.group(1)
+    except OSError:
+        pass
+    return "Spotifyd@" + socket.gethostname()
+
+
+# How long to leave spotifyd alone after it failed to play. Spotify can refuse
+# librespot-based clients the audio key for an account ("error audio key 0 1")
+# for days at a time; without a cooldown every pick would first sit through a
+# doomed spotifyd attempt before reaching the app.
+SPOTIFYD_COOLDOWN = 3600
+SPOTIFYD_STATE_FILE = os.path.join(STATE_DIR, "spotifyd.json")
+
+
+def spotifyd_cooling_down():
+    try:
+        with open(SPOTIFYD_STATE_FILE) as f:
+            return json.load(f).get("failed_at", 0) + SPOTIFYD_COOLDOWN > time.time()
+    except (OSError, ValueError):
+        return False
+
+
+def mark_spotifyd(failed):
+    if not failed:
+        try:
+            os.remove(SPOTIFYD_STATE_FILE)
+        except FileNotFoundError:
+            pass
+        return
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    with open(SPOTIFYD_STATE_FILE, "w") as f:
+        json.dump({"failed_at": time.time()}, f)
+
+
+def spotifyd_device():
+    """Start spotifyd if needed and wait for its Connect device.
+
+    spotifyd is a headless Connect device: no window to keep open, and closing
+    the Spotify app does not stop it. When enabled it wins over whatever device
+    happens to be active, so a pick from the panel plays on this machine
+    rather than, say, a phone.
+    """
+    name = spotifyd_device_name()
+    # Opt-in by enabling the user unit: an installed but unused spotifyd
+    # would otherwise be started here and take every pick.
+    if not name or subprocess.run(["systemctl", "--user", "is-enabled", "--quiet", "spotifyd"]).returncode != 0:
+        return None
+    if spotifyd_cooling_down():
+        return None
+    if subprocess.run(["systemctl", "--user", "is-active", "--quiet", "spotifyd"]).returncode != 0:
+        subprocess.run(["systemctl", "--user", "start", "spotifyd"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def find():
+        for d in api("GET", "/me/player/devices").get("devices", []):
+            if d.get("name") == name and d.get("id") and not d.get("is_restricted"):
+                return d
+        return None
+    return wait_for(find, 15)
+
+
+def start_playback(device, uri):
+    api("PUT", "/me/player/play?" + urllib.parse.urlencode({"device_id": device["id"]}),
+        body={"uris": [uri]})
+
+
+def spotifyd_stream_open():
+    """Whether spotifyd has an uncorked audio stream open in PipeWire.
+
+    None when that cannot be checked (no pactl), so the caller can fall back
+    to the Web API alone.
+    """
+    if not shutil.which("pactl"):
+        return None
+    pid = subprocess.run(["systemctl", "--user", "show", "-p", "MainPID", "--value", "spotifyd"],
+                         capture_output=True, text=True).stdout.strip()
+    out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
+                         capture_output=True, text=True).stdout
+    try:
+        inputs = json.loads(out or "[]")
+    except ValueError:
+        return None
+    for i in inputs:
+        props = i.get("properties", {})
+        if i.get("corked"):
+            continue
+        if (props.get("application.process.id") == pid
+                or props.get("application.process.binary") == "spotifyd"):
+            return True
+    return False
+
+
+def audibly_playing(device, uri, timeout=10):
+    """Whether device is really playing uri, not just accepted the request.
+
+    The Web API is no proof on its own: when spotifyd is refused the audio
+    key, the API still reports the track playing, position climbing, for the
+    ~3 s spotifyd spends downloading it before it gives up. The track has to
+    be reported playing *and* spotifyd has to have audio flowing into
+    PipeWire, which it never does in that failure.
+    """
+    deadline = time.time() + timeout
+    seen = False
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            st = api("GET", "/me/player") or {}
+        except ApiError:
+            continue
+        reported = ((st.get("device") or {}).get("id") == device["id"]
+                    and st.get("is_playing")
+                    and (st.get("item") or {}).get("uri") == uri)
+        if not reported:
+            # Reported playing, then stopped: spotifyd gave up on the track,
+            # no need to sit out the rest of the timeout.
+            if seen:
+                return False
+            continue
+        seen = True
+        stream = spotifyd_stream_open()
+        if stream or (stream is None and st.get("progress_ms", 0) >= 6000):
+            return True
+    return False
+
+
+def cmd_play(args):
+    if not args:
+        return 1
+    uri = args[0]
+
+    try:
+        headless = spotifyd_device()
+        if headless:
+            start_playback(headless, uri)
+            if audibly_playing(headless, uri):
+                mark_spotifyd(failed=False)
+                return 0
+            mark_spotifyd(failed=True)
+            print("spotifyd did not start playing; falling back to the app", file=sys.stderr)
+
+        exclude = headless["id"] if headless else None
+        device = pick_device(api("GET", "/me/player/devices").get("devices", []), exclude)
+
+        if not device and spotify_command():
+            # A cold desktop client takes a while to sign in and register as a
+            # Connect device, so start it (unless it is already starting) and
+            # wait rather than failing outright.
+            if not spotify_process_alive():
+                launch_spotify()
+            device = wait_for(
+                lambda: pick_device(api("GET", "/me/player/devices").get("devices", []), exclude), 25)
+
+        if not device:
+            return EXIT_NO_DEVICE
+        start_playback(device, uri)
+    except ApiError as e:
+        if e.status == 403 and e.reason == "PREMIUM_REQUIRED":
+            return EXIT_PREMIUM_REQUIRED
+        if e.status == 404:
+            return EXIT_NO_DEVICE
+        raise
+    return 0
+
+
+# ------------------------------------------------------------------ open
+
+def web_url(uri):
+    parts = (uri or "").split(":", 2)
+    if len(parts) == 3 and parts[0] == "spotify":
+        return "https://open.spotify.com/%s/%s" % (parts[1], urllib.parse.quote(parts[2]))
+    return "https://open.spotify.com/"
+
+
+def cmd_open(args):
+    """No-API fallback: point the Spotify app (or the web player) at URI.
+
+    Works without a login or Premium. A track URI starts playing; a
+    spotify:search: URI lands on the app's search results.
+    """
+    uri = args[0] if args else ""
+    # A client that is still starting up has no MPRIS name yet; launching
+    # another would only open a second window, so wait for it instead.
+    if not spotify_running() and spotify_process_alive():
+        wait_for(spotify_running, 15)
+    if spotify_running():
+        if uri:
+            subprocess.run(
+                ["gdbus", "call", "--session", "--dest", MPRIS_NAME,
+                 "--object-path", "/org/mpris/MediaPlayer2",
+                 "--method", "org.mpris.MediaPlayer2.Player.OpenUri", uri],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+    if spotify_command():
+        launch_spotify(uri or None)
+        return 0
+    subprocess.Popen(["omarchy-launch-webapp", web_url(uri)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return 0
+
+
+COMMANDS = {
+    "login": cmd_login,
+    "logout": cmd_logout,
+    "status": cmd_status,
+    "search": cmd_search,
+    "play": cmd_play,
+    "open": cmd_open,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__.strip(), file=sys.stderr)
+        return 1
+    try:
+        return COMMANDS[sys.argv[1]](sys.argv[2:])
+    except NotConnected:
+        print("Spotify is not connected: run spotify-helper login", file=sys.stderr)
+        return EXIT_NOT_CONNECTED
+    except (ApiError, urllib.error.URLError, OSError) as e:
+        print("Spotify request failed: %s" % e, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

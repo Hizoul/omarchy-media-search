@@ -101,27 +101,48 @@ Item {
   property bool searching: false
   property string searchError: ""
 
+  // "youtube" or "spotify". Results carry their provider, and a Spotify
+  // result's id is its spotify: URI, so playResult routes on the id alone.
+  property string searchProvider: "youtube"
+
+  function setSearchProvider(provider) {
+    var p = provider === "spotify" ? "spotify" : "youtube"
+    if (p === searchProvider) return
+    searchProvider = p
+    if (p === "spotify") refreshSpotifyStatus()
+    // Results from the other provider are meaningless under the new one.
+    if (searchQuery) search(searchQuery)
+  }
+
   function search(query) {
     var q = String(query || "").trim()
     searchQuery = q
     searchError = ""
-    if (!q) {
-      searchResults = []
-      searching = false
-      searchProc.running = false
-      return
-    }
-    searching = true
-    searchResults = []
     // Drop any in-flight query before starting the next one: restarting while
     // running would otherwise leave the old process to overwrite our results.
     searchProc.running = false
-    searchProc.query = q
-    Qt.callLater(function() { if (root.searchQuery === q) searchProc.running = true })
+    spotifySearchProc.running = false
+    if (!q) {
+      searchResults = []
+      searching = false
+      return
+    }
+    searchResults = []
+
+    if (searchProvider === "spotify" && !spotifyConnected) {
+      openSpotifySearch(q)
+      return
+    }
+
+    searching = true
+    var proc = searchProvider === "spotify" ? spotifySearchProc : searchProc
+    proc.query = q
+    Qt.callLater(function() { if (root.searchQuery === q) proc.running = true })
   }
 
   function clearSearch() {
     searchProc.running = false
+    spotifySearchProc.running = false
     searchQuery = ""
     searchResults = []
     searching = false
@@ -132,9 +153,10 @@ Item {
   // that existed beforehand so the newcomer can be identified.
   property var localPlaybackPending: null
 
-  function playResult(videoId) {
-    var id = String(videoId || "").trim()
+  function playResult(resultId) {
+    var id = String(resultId || "").trim()
     if (!id) return false
+    if (id.indexOf("spotify:") === 0) return playSpotify(id)
 
     var before = ({})
     for (var i = 0; i < players.length; i++) {
@@ -173,7 +195,10 @@ Item {
 
     for (var i = 0; i < players.length; i++) {
       var key = playerKey(players[i])
-      if (!key || pending.before[key]) continue
+      if (!key) continue
+      // Spotify is usually already on the bus, so it is found by name instead
+      // of by being new.
+      if (pending.match ? key.toLowerCase().indexOf(pending.match) === -1 : pending.before[key]) continue
       preferredPlayerKey = key
       localPlaybackPending = null
       localPlayerTimer.stop()
@@ -214,7 +239,7 @@ Item {
     return mins + ":" + (rest < 10 ? "0" + rest : String(rest))
   }
 
-  function applySearchOutput(raw) {
+  function applySearchOutput(raw, provider) {
     var lines = String(raw || "").split("\n")
     var out = []
     for (var i = 0; i < lines.length; i++) {
@@ -224,7 +249,8 @@ Item {
       var parts = line.split("\t")
       if (parts.length < 2 || !parts[0]) continue
       out.push({
-        videoId: parts[0],
+        provider: provider,
+        id: parts[0],
         title: parts[1] || parts[0],
         uploader: parts.length > 2 ? parts[2] : "",
         duration: root.formatDuration(parts.length > 3 ? parts[3] : 0)
@@ -242,13 +268,110 @@ Item {
 
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applySearchOutput(text)
+      onStreamFinished: root.applySearchOutput(text, "youtube")
     }
 
     onExited: function(exitCode) {
       root.searching = false
       if (exitCode !== 0 && root.searchResults.length === 0) root.searchError = "Search failed"
       else if (root.searchResults.length === 0) root.searchError = "No results"
+    }
+  }
+
+  // ---------------------------------------------------------- spotify
+  // All Web API traffic goes through spotify-helper, which keeps the OAuth
+  // token out of the shell. Connected (a login on file) means in-panel search
+  // and Spotify Connect playback, which needs Premium. Anything short of that
+  // falls back to handing the query or track URI to the Spotify app itself.
+  readonly property string spotifyHelper: decodeURIComponent(
+    Qt.resolvedUrl("spotify-helper").toString().replace(/^file:\/\//, ""))
+  readonly property int spotifyExitNotConnected: 2
+  readonly property int spotifyExitPremiumRequired: 3
+  readonly property int spotifyExitNoDevice: 4
+  property bool spotifyConnected: false
+
+  function refreshSpotifyStatus() {
+    spotifyStatusProc.running = false
+    Qt.callLater(function() { spotifyStatusProc.running = true })
+  }
+
+  function connectSpotify() {
+    Quickshell.execDetached(["xdg-terminal-exec", spotifyHelper, "login"])
+  }
+
+  function openSpotify(uri) {
+    Quickshell.execDetached(uri ? [spotifyHelper, "open", uri] : [spotifyHelper, "open"])
+  }
+
+  function openSpotifySearch(query) {
+    openSpotify("spotify:search:" + query)
+    searchError = "Opened in Spotify. Connect Spotify to see results here."
+  }
+
+  function playSpotify(uri) {
+    // mpv is ours to stop outright; anything else just gets paused so the
+    // pick replaces it instead of playing on top.
+    stopPlayback()
+    var current = activePlayer
+    if (current && playerKey(current).toLowerCase().indexOf("spotify") === -1) pausePlayer(current)
+
+    if (!spotifyConnected) {
+      openSpotify(uri)
+    } else {
+      spotifyPlayProc.running = false
+      spotifyPlayProc.uri = uri
+      Qt.callLater(function() { spotifyPlayProc.running = true })
+    }
+    localPlaybackPending = { match: "spotify", attempts: 0 }
+    localPlayerTimer.restart()
+    return true
+  }
+
+  Process {
+    id: spotifyStatusProc
+    command: [root.spotifyHelper, "status"]
+    onExited: function(exitCode) { root.spotifyConnected = exitCode === 0 }
+  }
+
+  Process {
+    id: spotifySearchProc
+    property string query: ""
+    command: [root.spotifyHelper, "search", query, String(root.searchLimit)]
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applySearchOutput(text, "spotify")
+    }
+
+    onExited: function(exitCode) {
+      root.searching = false
+      if (exitCode === root.spotifyExitNotConnected) {
+        root.spotifyConnected = false
+        root.openSpotifySearch(query)
+      } else if (exitCode !== 0 && root.searchResults.length === 0) root.searchError = "Spotify search failed"
+      else if (root.searchResults.length === 0) root.searchError = "No results"
+    }
+  }
+
+  Process {
+    id: spotifyPlayProc
+    property string uri: ""
+    command: [root.spotifyHelper, "play", uri]
+
+    // Every failure still gets the track playing where it can: OpenUri on the
+    // desktop app plays a track URI without the Web API, and without Premium.
+    onExited: function(exitCode) {
+      if (exitCode === 0) return
+      if (exitCode === root.spotifyExitNotConnected) {
+        root.spotifyConnected = false
+      } else if (exitCode === root.spotifyExitPremiumRequired) {
+        root.showOsd("Spotify Premium required. Opening in Spotify", "media", null)
+      } else if (exitCode === root.spotifyExitNoDevice) {
+        root.showOsd("No Spotify device. Opening Spotify", "media", null)
+      } else {
+        root.showOsd("Spotify playback failed", "media", null)
+      }
+      root.openSpotify(uri)
     }
   }
 
@@ -691,7 +814,10 @@ Item {
   // syncPlayingOrder only depends on the set of players and each player's
   // isPlaying state: onPlayersChanged covers players appearing/disappearing,
   // and the Instantiator wires isPlayingChanged for each live player.
-  Component.onCompleted: root.syncPlayingOrder()
+  Component.onCompleted: {
+    root.syncPlayingOrder()
+    root.refreshSpotifyStatus()
+  }
   onPlayersChanged: {
     root.syncPlayingOrder()
     // Catch the new mpv bus as soon as it appears instead of on the next tick.
@@ -782,17 +908,23 @@ Item {
       return "ok"
     }
 
+    function provider(name: string): string {
+      root.setSearchProvider(name)
+      return root.searchProvider
+    }
+
     function results(): string {
       return JSON.stringify({
         query: root.searchQuery,
+        provider: root.searchProvider,
         searching: root.searching,
         error: root.searchError,
         results: root.searchResults
       })
     }
 
-    function playId(videoId: string): string {
-      return root.playResult(videoId) ? "ok" : "unhandled"
+    function playId(id: string): string {
+      return root.playResult(id) ? "ok" : "unhandled"
     }
 
     function stop(): string {

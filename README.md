@@ -14,6 +14,8 @@ the transport buttons need no special casing for it.
 ## Features
 
 - Search YouTube from the bar and play a result without opening a browser
+- Search Spotify too, and start the pick on your Spotify app — see
+  [Spotify](#spotify)
 - Autoplay related: when a locally streamed track ends on its own, queue the
   next entry from YouTube's auto-generated radio mix for that video
 - Repeat, driven by the active player's own MPRIS `LoopStatus`, so it works for
@@ -130,6 +132,76 @@ o.bind("SUPER + M", "Music search", "omarchy-shell media-search toggle")
 
 `open` and `close` are available alongside `toggle`.
 
+## Spotify
+
+Switch the panel to **Spotify** with the chip above the search field, or `Tab`
+in the field. What you get depends on how far you set it up:
+
+| Setup | Search | Playing a result |
+| --- | --- | --- |
+| Nothing | Opens the query in the Spotify app (or the web player) | — |
+| Connected, free account | Results in the panel | Opens the track in the Spotify app |
+| Connected, Premium | Results in the panel | Starts on a Spotify Connect device |
+
+Connecting needs your own Spotify developer app. Since February 2026 Spotify
+only runs development-mode apps whose owner has Premium, so on a free account
+you can stop at "Nothing". Everything still works, just from the Spotify app.
+
+1. Create an app at <https://developer.spotify.com/dashboard>, with **Web API**
+   selected and this redirect URI:
+
+   ```
+   http://127.0.0.1:8898/callback
+   ```
+
+2. Press **Connect** in the panel, or run `spotify-helper login` from the plugin
+   directory, and paste the app's Client ID. The browser opens for you to
+   approve access.
+
+Playback goes to the device already active in your account; with none active,
+the helper starts the desktop app (`spotify-launcher` from `extra`) and waits
+for it to show up. Now-playing and the transport buttons come from the app's
+own MPRIS player, so they need no Spotify-specific handling.
+
+Autoplay related is YouTube-only. For Spotify, turn on the app's own
+**Autoplay** setting instead.
+
+### Headless playback with spotifyd
+
+With the desktop app as the player, closing its window stops the music.
+[spotifyd](https://github.com/Spotifyd/spotifyd) (`extra`) is a windowless
+Connect device that runs as a user service instead. It is opt-in: the helper
+uses it only while its user unit is enabled.
+
+```bash
+sudo pacman -S spotifyd
+spotifyd authenticate            # browser login, cached under cache_path
+systemctl --user enable --now spotifyd
+```
+
+A minimal `~/.config/spotifyd/spotifyd.conf`:
+
+```toml
+[global]
+device_name = "Omarchy"
+backend = "pulseaudio"
+use_mpris = true
+autoplay = true
+```
+
+Spotify sometimes refuses librespot-based players the decryption key for an
+account (`error audio key 0 1` in `journalctl --user -u spotifyd`), and the
+Web API still reports such a track as playing for a few seconds. So after
+starting a track on spotifyd the helper waits for spotifyd's audio stream to
+show up in PipeWire. If it does not, the track goes to the desktop app
+instead, and spotifyd is skipped for an hour so later picks do not wait on
+it. To retry sooner, delete
+`$XDG_STATE_HOME/omarchy-media-search/spotifyd.json`.
+
+To use another port, set `MEDIA_SEARCH_SPOTIFY_PORT` and register the matching
+redirect URI. To disconnect, run `spotify-helper logout`, and remove access at
+<https://www.spotify.com/account/apps/>.
+
 ## YouTube Music
 
 The **Open YouTube Music** button runs:
@@ -192,9 +264,14 @@ the other.
 ## Privacy
 
 Search runs `yt-dlp` against YouTube directly from your machine, and playback
-streams from YouTube through `mpv`. No credentials are read or stored, and
-nothing is sent anywhere else. Result titles and uploader names are rendered as
-plain text.
+streams from YouTube through `mpv`. Result titles and uploader names are
+rendered as plain text.
+
+YouTube needs no credentials. Once you connect Spotify, `spotify-helper` keeps a
+refresh token and your app's Client ID in
+`$XDG_STATE_HOME/omarchy-media-search/spotify.json` (mode `0600`). It talks only
+to Spotify's own API. The token never reaches the shell process, and no client
+secret is involved because the login uses PKCE.
 
 ## Develop
 
