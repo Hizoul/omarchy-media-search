@@ -101,7 +101,12 @@ def request(method, url, token=None, form=None, body=None):
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read()
-            return json.loads(raw) if raw else None
+            # Some player endpoints answer 200 with a non-JSON body (an
+            # opaque id) instead of 204; nothing here needs it.
+            try:
+                return json.loads(raw) if raw else None
+            except ValueError:
+                return None
     except urllib.error.HTTPError as e:
         reason = ""
         try:
